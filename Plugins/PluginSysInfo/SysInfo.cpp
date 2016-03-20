@@ -16,6 +16,7 @@
   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
+#include <algorithm>
 #include <windows.h>
 #include <Iphlpapi.h>
 #include <Netlistmgr.h>
@@ -24,6 +25,9 @@
 #include "../API/RainmeterAPI.h"
 #include "../../Library/Export.h"
 #include"../../Common/Platform.h"
+#include "../../Common/StringUtil.h"
+
+#define INADDR_ANY (ULONG)0x00000000
 
 typedef struct
 {
@@ -43,6 +47,7 @@ enum MeasureType
 	MEASURE_SCREEN_SIZE,
 	MEASURE_RAS_STATUS,
 	MEASURE_OS_VERSION,
+	MEASURE_PAGESIZE,
 	MEASURE_OS_BITS,
 	MEASURE_IDLE_TIME,
 	MEASURE_ADAPTER_DESCRIPTION,
@@ -64,7 +69,13 @@ enum MeasureType
 	MEASURE_VIRTUAL_SCREEN_TOP,
 	MEASURE_VIRTUAL_SCREEN_LEFT,
 	MEASURE_VIRTUAL_SCREEN_WIDTH,
-	MEASURE_VIRTUAL_SCREEN_HEIGHT
+	MEASURE_VIRTUAL_SCREEN_HEIGHT,
+	MEASURE_TIMEZONE_ISDST,
+	MEASURE_TIMEZONE_BIAS,
+	MEASURE_TIMEZONE_STANDARD_BIAS,
+	MEASURE_TIMEZONE_STANDARD_NAME,
+	MEASURE_TIMEZONE_DAYLIGHT_BIAS,
+	MEASURE_TIMEZONE_DAYLIGHT_NAME
 };
 
 struct MeasureData
@@ -72,11 +83,14 @@ struct MeasureData
 	MeasureType type;
 	int data;
 
-	MeasureData() : type(), data() {}
+	bool useBestInterface;
+
+	MeasureData() : type(), data(), useBestInterface(false) {}
 };
 
 NLM_CONNECTIVITY GetNetworkConnectivity();
 BOOL CALLBACK MyInfoEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData);
+int GetBestInterfaceOrByName(LPCWSTR data, bool& found);
 
 bool g_Initialized = false;
 
@@ -129,6 +143,10 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	{
 		measure->type = MEASURE_OS_VERSION;
 	}
+	else if (_wcsicmp(L"PAGESIZE", type) == 0)
+	{
+		measure->type = MEASURE_PAGESIZE;
+	}	
 	else if (_wcsicmp(L"OS_BITS", type) == 0)
 	{
 		measure->type = MEASURE_OS_BITS;
@@ -221,6 +239,30 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	{
 		measure->type = MEASURE_VIRTUAL_SCREEN_HEIGHT;
 	}
+	else if (_wcsicmp(L"TIMEZONE_ISDST", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_ISDST;
+	}
+	else if (_wcsicmp(L"TIMEZONE_BIAS", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_BIAS;
+	}
+	else if (_wcsicmp(L"TIMEZONE_STANDARD_BIAS", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_STANDARD_BIAS;
+	}
+	else if (_wcsicmp(L"TIMEZONE_STANDARD_NAME", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_STANDARD_NAME;
+	}
+	else if (_wcsicmp(L"TIMEZONE_DAYLIGHT_BIAS", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_DAYLIGHT_BIAS;
+	}
+	else if (_wcsicmp(L"TIMEZONE_DAYLIGHT_NAME", type) == 0)
+	{
+		measure->type = MEASURE_TIMEZONE_DAYLIGHT_NAME;
+	}
 	else
 	{
 		WCHAR buffer[256];
@@ -228,7 +270,23 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		RmLog(LOG_ERROR, buffer);
 	}
 
-	measure->data = RmReadInt(rm, L"SysInfoData", defaultData);
+	measure->useBestInterface = false;
+	if (measure->type >= MEASURE_ADAPTER_DESCRIPTION && measure->type <= MEASURE_GATEWAY_ADDRESS)
+	{
+		std::wstring siData = RmReadString(rm, L"SysInfoData", L"");
+		if (!siData.empty() && !std::all_of(siData.begin(), siData.end(), iswdigit))
+		{
+			measure->data = GetBestInterfaceOrByName(siData.c_str(), measure->useBestInterface);
+		}
+		else
+		{
+			measure->data = RmReadInt(rm, L"SysInfoData", defaultData);
+		}
+	}
+	else
+	{
+		measure->data = RmReadInt(rm, L"SysInfoData", defaultData);
+	}
 }
 
 PLUGIN_EXPORT LPCWSTR GetString(void* data)
@@ -275,13 +333,23 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 			int i = 0;
 			while (info)
 			{
-				if (i == measure->data)
+				if (measure->useBestInterface)
 				{
-					return convertToWide(info->Description);
+					if (info->Index == measure->data)
+					{
+						return convertToWide(info->Description);
+					}
+				}
+				else
+				{
+					if (i == measure->data)
+					{
+						return convertToWide(info->Description);
+					}
 				}
 
 				info = info->Next;
-				i++;
+				++i;
 			}
 		}
 		break;
@@ -290,7 +358,19 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 		if (NO_ERROR == GetIpAddrTable((PMIB_IPADDRTABLE)tmpBuffer, &tmpBufferLen, FALSE))
 		{
 			PMIB_IPADDRTABLE ipTable = (PMIB_IPADDRTABLE)tmpBuffer;
-			if (measure->data >= 1000)
+			if (measure->useBestInterface)
+			{
+				for (UINT i = 0; i < ipTable->dwNumEntries; ++i)
+				{
+					if (ipTable->table[i].dwIndex == measure->data)
+					{
+						DWORD ip = ipTable->table[i].dwAddr;
+						wsprintf(sBuffer, L"%i.%i.%i.%i", ip % 256, (ip >> 8) % 256, (ip >> 16) % 256, (ip >> 24) % 256);
+						return sBuffer;
+					}
+				}
+			}
+			else if (measure->data >= 1000)
 			{
 				measure->data = measure->data - 999;
 				for (UINT i = 0; i < ipTable->dwNumEntries; ++i)
@@ -318,7 +398,19 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 		if (NO_ERROR == GetIpAddrTable((PMIB_IPADDRTABLE)tmpBuffer, &tmpBufferLen, FALSE))
 		{
 			PMIB_IPADDRTABLE ipTable = (PMIB_IPADDRTABLE)tmpBuffer;
-			if (measure->data < (int)ipTable->dwNumEntries)
+			if (measure->useBestInterface)
+			{
+				for (UINT i = 0; i < ipTable->dwNumEntries; ++i)
+				{
+					if (ipTable->table[i].dwIndex == measure->data)
+					{
+						DWORD ip = ipTable->table[i].dwMask;
+						wsprintf(sBuffer, L"%i.%i.%i.%i", ip % 256, (ip >> 8) % 256, (ip >> 16) % 256, (ip >> 24) % 256);
+						return sBuffer;
+					}
+				}
+			}
+			else if (measure->data < (int)ipTable->dwNumEntries)
 			{
 				DWORD ip = ipTable->table[measure->data].dwMask;
 				wsprintf(sBuffer, L"%i.%i.%i.%i", ip % 256, (ip >> 8) % 256, (ip >> 16) % 256, (ip >> 24) % 256);
@@ -334,7 +426,14 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 			int i = 0;
 			while (info)
 			{
-				if (i == measure->data)
+				if (measure->useBestInterface)
+				{
+					if (info->Index == measure->data)
+					{
+						return convertToWide(info->GatewayList.IpAddress.String);
+					}
+				}
+				else if (i == measure->data)
 				{
 					return convertToWide(info->GatewayList.IpAddress.String);
 				}
@@ -374,6 +473,22 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 			}
 		}
 		break;
+
+	case MEASURE_TIMEZONE_STANDARD_NAME:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			GetTimeZoneInformation(&tzi);
+			wcscpy(sBuffer, tzi.StandardName);
+			return sBuffer;
+		}
+
+	case MEASURE_TIMEZONE_DAYLIGHT_NAME:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			GetTimeZoneInformation(&tzi);
+			wcscpy(sBuffer, tzi.DaylightName);
+			return sBuffer;
+		}
 	}
 
 	return nullptr;
@@ -385,6 +500,12 @@ PLUGIN_EXPORT double Update(void* data)
 
 	switch (measure->type)
 	{
+	case MEASURE_PAGESIZE:
+		{
+			SYSTEM_INFO si = { 0 };
+			GetNativeSystemInfo(&si);
+			return (si.dwPageSize);
+		}
 	case MEASURE_OS_BITS:
 		{
 			SYSTEM_INFO si = {0};
@@ -458,6 +579,31 @@ PLUGIN_EXPORT double Update(void* data)
 		return (measure->data != -1)
 			? m_Monitors.m_MonitorInfo[measure->data - 1].rcMonitor.left
 			: GetSystemMetrics(SM_XVIRTUALSCREEN);
+
+	case MEASURE_TIMEZONE_ISDST:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			DWORD ret = GetTimeZoneInformation(&tzi);
+			return ret == TIME_ZONE_ID_UNKNOWN ? -1.0 : ret - 1.0;
+		}
+	case MEASURE_TIMEZONE_BIAS:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			GetTimeZoneInformation(&tzi);
+			return (double)tzi.Bias;
+		}
+	case MEASURE_TIMEZONE_STANDARD_BIAS:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			GetTimeZoneInformation(&tzi);
+			return (double)tzi.StandardBias;
+		}
+	case MEASURE_TIMEZONE_DAYLIGHT_BIAS:
+		{
+			TIME_ZONE_INFORMATION tzi;
+			GetTimeZoneInformation(&tzi);
+			return (double)tzi.DaylightBias;
+		}
 	}
 
 	return 0.0;
@@ -497,4 +643,44 @@ NLM_CONNECTIVITY GetNetworkConnectivity()
 	}
 
 	return connectivity;
+}
+
+int GetBestInterfaceOrByName(LPCWSTR data, bool& found)
+{
+	int index = 0;
+
+	if (_wcsicmp(data, L"BEST") == 0)
+	{
+		DWORD dwBestIndex;
+		if (NO_ERROR == GetBestInterface(INADDR_ANY, &dwBestIndex))
+		{
+			index = (int)dwBestIndex;
+			found = true;
+		}
+	}
+	else
+	{
+		BYTE buffer[7168];
+		ULONG bufLen = _countof(buffer);
+
+		if (ERROR_SUCCESS == GetAdaptersInfo((IP_ADAPTER_INFO*)buffer, &bufLen))
+		{
+			PIP_ADAPTER_INFO info = (IP_ADAPTER_INFO*)buffer;
+			int i = 0;
+			while (info)
+			{
+				if (_wcsicmp(data, StringUtil::Widen(info->Description).c_str()) == 0)
+				{
+					index = info->Index;
+					found = true;
+					break;
+				}
+
+				info = info->Next;
+				++i;
+			}
+		}
+	}
+
+	return index;
 }

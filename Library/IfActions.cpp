@@ -21,8 +21,8 @@
 #include "IfActions.h"
 #include "Rainmeter.h"
 #include "../Common/MathParser.h"
-#include "pcre-8.10/config.h"
-#include "pcre-8.10/pcre.h"
+#include "pcre/config.h"
+#include "pcre/pcre.h"
 
 IfActions::IfActions() :
 	m_AboveValue(0.0f),
@@ -267,9 +267,9 @@ void IfActions::DoIfActions(Measure& measure, double value)
 			const char* error;
 			int errorOffset;
 
-			pcre* re = pcre_compile(
-				StringUtil::NarrowUTF8(item.value).c_str(),
-				PCRE_UTF8,
+			pcre16* re = pcre16_compile(
+				(PCRE_SPTR16)item.value.c_str(),
+				PCRE_UTF16,
 				&error,
 				&errorOffset,
 				nullptr);
@@ -294,14 +294,14 @@ void IfActions::DoIfActions(Measure& measure, double value)
 			{
 				item.parseError = false;
 
-				std::string utf8str = StringUtil::NarrowUTF8(measure.GetStringValue());
+				const WCHAR* str = measure.GetStringValue();
+				int strLen = str ? wcslen(str) : 0;
 				int ovector[300];
-
-				int rc = pcre_exec(
+				int rc = pcre16_exec(
 					re,
 					nullptr,
-					utf8str.c_str(),
-					(int)utf8str.length(),
+					(PCRE_SPTR16)str,
+					(int)strLen,
 					0,
 					0,
 					ovector,
@@ -330,7 +330,7 @@ void IfActions::DoIfActions(Measure& measure, double value)
 			}
 
 			// Release memory used for the compiled pattern
-			pcre_free(re);
+			pcre16_free(re);
 		}
 	}
 }

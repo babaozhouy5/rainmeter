@@ -52,7 +52,10 @@ enum TIMER
 	TIMER_MOUSE      = 2,
 	TIMER_FADE       = 3,
 	TIMER_TRANSITION = 4,
-	TIMER_DEACTIVATE = 5
+	TIMER_DEACTIVATE = 5,
+
+	// Update this when adding a new timer.
+	TIMER_MAX        = 5
 };
 enum INTERVAL
 {
@@ -95,6 +98,8 @@ Skin::Skin(const std::wstring& folderPath, const std::wstring& file) : m_FolderP
 	m_WindowH(),
 	m_ScreenX(),
 	m_ScreenY(),
+	m_SkinW(),
+	m_SkinH(),
 	m_AnchorXFromRight(false),
 	m_AnchorYFromBottom(false),
 	m_AnchorXPercentage(false),
@@ -138,7 +143,8 @@ Skin::Skin(const std::wstring& folderPath, const std::wstring& file) : m_FolderP
 	m_UpdateCounter(),
 	m_MouseMoveCounter(),
 	m_FontCollection(),
-	m_ToolTipHidden(false)
+	m_ToolTipHidden(false),
+	m_Favorite(false)
 {
 	if (!c_DwmInstance && IsWindowsVistaOrGreater() &&
 		(c_DwmInstance = System::RmLoadLibrary(L"dwmapi.dll")) != nullptr)
@@ -165,6 +171,9 @@ Skin::Skin(const std::wstring& folderPath, const std::wstring& file) : m_FolderP
 	}
 
 	++c_InstanceCount;
+
+	// Favorites stored in skin registry.
+	m_Favorite = GetRainmeter().IsSkinAFavorite(folderPath, file);
 }
 
 Skin::~Skin()
@@ -978,6 +987,14 @@ void Skin::DoBang(Bang bang, const std::vector<std::wstring>& args)
 	}
 }
 
+void Skin::DoDelayedCommand(const WCHAR* command, UINT delay)
+{
+	static UINT_PTR id = TIMER_MAX;
+	++id;
+	SetTimer(m_Window, id, delay, nullptr);
+	m_DelayedCommands.emplace(id, command);
+}
+
 void Skin::ShowBlur()
 {
 	if (c_DwmGetColorizationColor && c_DwmIsCompositionEnabled && c_DwmEnableBlurBehindWindow)
@@ -1481,6 +1498,10 @@ void Skin::SetOption(const std::wstring& section, const std::wstring& option, co
 */
 void Skin::WindowToScreen()
 {
+	// Use user defined width and/or height if necessary
+	if (m_SkinW > 0) m_WindowW = m_SkinW;
+	if (m_SkinH > 0) m_WindowH = m_SkinH;
+
 	std::wstring::size_type index, index2;
 	int pixel = 0;
 	float num;
@@ -2027,9 +2048,13 @@ bool Skin::ReadSkin()
 		return false;
 	}
 
+	// Read user defined skin width and height
+	m_SkinW = m_Parser.ReadInt(L"Rainmeter", L"SkinWidth", 0);
+	m_SkinH = m_Parser.ReadInt(L"Rainmeter", L"SkinHeight", 0);
+
 	// Initialize window variables
 	SetWindowPositionVariables(m_ScreenX, m_ScreenY);
-	SetWindowSizeVariables(0, 0);
+	SetWindowSizeVariables(m_SkinW, m_SkinH);
 
 	// Global settings
 	const std::wstring& group = m_Parser.ReadString(L"Rainmeter", L"Group", L"");
@@ -2899,6 +2924,16 @@ LRESULT Skin::OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam)
 			delete this;
 		}
 		break;
+
+	default:
+		{
+			auto it = m_DelayedCommands.find(wParam);
+			if (it != m_DelayedCommands.end()) {
+				KillTimer(m_Window, wParam);
+				GetRainmeter().ExecuteCommand(it->second.c_str(), this, true);
+				m_DelayedCommands.erase(it);
+			}
+		}
 	}
 
 	return 0;
@@ -3348,6 +3383,10 @@ LRESULT Skin::OnCommand(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		SetUseD2D(!m_UseD2D);
 		break;
 
+	case IDM_SKIN_FAVORITE:
+		SetFavorite(!m_Favorite);
+		break;
+
 	case IDM_SKIN_CLICKTHROUGH:
 		SetClickThrough(!m_ClickThrough);
 		break;
@@ -3414,9 +3453,17 @@ LRESULT Skin::OnCommand(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		break;
 
 	default:
-		if (wParam >= IDM_SKIN_TRANSPARENCY_0 && wParam <= IDM_SKIN_TRANSPARENCY_90)
+		if (wParam >= IDM_SKIN_TRANSPARENCY_0 && wParam <= IDM_SKIN_TRANSPARENCY_100)
 		{
-			m_AlphaValue = (int)(255.0 - (wParam - IDM_SKIN_TRANSPARENCY_0) * (230.0 / (IDM_SKIN_TRANSPARENCY_90 - IDM_SKIN_TRANSPARENCY_0)));
+			if (wParam == IDM_SKIN_TRANSPARENCY_100)
+			{
+				m_AlphaValue = 1;
+			}
+			else
+			{
+				m_AlphaValue = (int)(255.0 - (wParam - IDM_SKIN_TRANSPARENCY_0) * (230.0 / (IDM_SKIN_TRANSPARENCY_90 - IDM_SKIN_TRANSPARENCY_0)));
+			}
+
 			UpdateWindowTransparency(m_AlphaValue);
 			WriteOptions(OPTION_ALPHAVALUE);
 		}
@@ -3533,6 +3580,15 @@ void Skin::SetUseD2D(bool b)
 	m_UseD2D = b;
 	WriteOptions(OPTION_USED2D);
 	Refresh(false);
+}
+
+void Skin::SetFavorite(bool b)
+{
+	m_Favorite = b;
+
+	DialogManage::UpdateSkins(this);
+
+	GetRainmeter().UpdateFavorites(m_FolderPath, m_FileName, b);
 }
 
 void Skin::SetWindowDraggable(bool b)

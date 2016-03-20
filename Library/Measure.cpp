@@ -33,11 +33,12 @@
 #include "MeasureTime.h"
 #include "MeasureCalc.h"
 #include "MeasureScript.h"
+#include "MeasureLoop.h"
 #include "Rainmeter.h"
 #include "Error.h"
 #include "Util.h"
-#include "pcre-8.10/config.h"
-#include "pcre-8.10/pcre.h"
+#include "pcre/config.h"
+#include "pcre/pcre.h"
 
 #define OVECCOUNT 300	// Should be a multiple of 3
 
@@ -223,10 +224,9 @@ const WCHAR* Measure::CheckSubstitute(const WCHAR* buffer)
 		return buffer;
 	}
 
+	str = buffer;
 	if (!m_RegExpSubstitute)
 	{
-		str = buffer;
-
 		for (size_t i = 0, isize = m_Substitute.size(); i < isize; i += 2)
 		{
 			if (!m_Substitute[i].empty())
@@ -242,17 +242,15 @@ const WCHAR* Measure::CheckSubstitute(const WCHAR* buffer)
 	}
 	else
 	{
-		std::string utf8str = StringUtil::NarrowUTF8(buffer);
 		int ovector[300];
-
 		for (size_t i = 0, isize = m_Substitute.size(); i < isize; i += 2)
 		{
 			const char* error;
 			int errorOffset;
 			int offset = 0;
-			pcre* re = pcre_compile(
-				StringUtil::NarrowUTF8(m_Substitute[i]).c_str(),
-				PCRE_UTF8,
+			pcre16* re = pcre16_compile(
+				(PCRE_SPTR16)m_Substitute[i].c_str(),
+				PCRE_UTF16,
 				&error,
 				&errorOffset,
 				nullptr);  // Use default character tables.
@@ -265,13 +263,14 @@ const WCHAR* Measure::CheckSubstitute(const WCHAR* buffer)
 			{
 				do
 				{
-					const int rc = pcre_exec(
+					const int options = str.empty() ? 0 : PCRE_NOTEMPTY;
+					const int rc = pcre16_exec(
 						re,
-						nullptr,           // No extra data - we didn't study the pattern
-						utf8str.c_str(),   // The subject string
-						(int)utf8str.length(),  // The length of the subject
+						nullptr,
+						(PCRE_SPTR16)str.c_str(),
+						(int)str.length(),
 						offset,
-						0,
+						options,               // Empty string is not a valid match
 						ovector,
 						(int)_countof(ovector));
 					if (rc <= 0)
@@ -279,24 +278,26 @@ const WCHAR* Measure::CheckSubstitute(const WCHAR* buffer)
 						break;
 					}
 
-					std::string result = StringUtil::NarrowUTF8(m_Substitute[i + 1]);
+					std::wstring result = m_Substitute[i + 1];
 
 					if (rc > 1)
 					{
 						for (int j = rc - 1 ; j >= 0 ; --j)
 						{
-							size_t newStart = ovector[2 * j];
+							int newStart = ovector[2 * j];
 							size_t inLength = ovector[2 * j + 1] - ovector[2 * j];
 
-							char tmpName[64];
-							size_t cutLength = _snprintf_s(tmpName, _TRUNCATE, "\\%i", j);;
+							if (newStart < 0) break;	// Match was not found, so skip to the next item
+
+							WCHAR tmpName[64];
+							size_t cutLength = _snwprintf_s(tmpName, _TRUNCATE, L"\\%i", j);
 							size_t start = 0, pos;
 							do
 							{
 								pos = result.find(tmpName, start, cutLength);
 								if (pos != std::string::npos)
 								{
-									result.replace(pos, cutLength, utf8str, newStart, inLength);
+									result.replace(pos, cutLength, str, (size_t)newStart, inLength);
 									start = pos + inLength;
 								}
 							}
@@ -306,16 +307,14 @@ const WCHAR* Measure::CheckSubstitute(const WCHAR* buffer)
 
 					const int start = ovector[0];
 					const int length = ovector[1] - ovector[0];
-					utf8str.replace(start, length, result);
+					str.replace(start, length, result);
 					offset = start + (int)result.length();
 				}
 				while (true);
 
-				pcre_free(re);
+				pcre16_free(re);
 			}
 		}
-
-		str = StringUtil::WidenUTF8(utf8str);
 	}
 
 	return str.c_str();
@@ -791,6 +790,10 @@ Measure* Measure::Create(const WCHAR* measure, Skin* skin, const WCHAR* name)
 	else if (_wcsicmp(L"String", measure) == 0)
 	{
 		return new MeasureString(skin, name);
+	}
+	else if (_wcsicmp(L"Loop", measure) == 0)
+	{
+		return new MeasureLoop(skin, name);
 	}
 
 	LogErrorF(skin, L"Measure=%s is not valid in [%s]", measure, name);

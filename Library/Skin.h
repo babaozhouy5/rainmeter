@@ -116,6 +116,7 @@ public:
 	void Initialize();
 
 	void DoBang(Bang bang, const std::vector<std::wstring>& args);
+	void DoDelayedCommand(const WCHAR* command, UINT delay);
 
 	void HideMeter(const std::wstring& name, bool group = false);
 	void ShowMeter(const std::wstring& name, bool group = false);
@@ -198,6 +199,8 @@ public:
 	int GetDefaultUpdateDivider() { return m_DefaultUpdateDivider; }
 
 	bool GetMeterToolTipHidden() { return m_ToolTipHidden; }
+
+	bool GetFavorite() { return m_Favorite; }
 
 	bool IsClosing() { return m_State == STATE_CLOSING; }
 
@@ -320,6 +323,7 @@ private:
 	void BlurBehindWindow(BOOL fEnable);
 	void SetWindowPositionVariables(int x, int y);
 	void SetWindowSizeVariables(int w, int h);
+	void SetFavorite(bool favorite);
 
 	void ShowBlur();
 	void HideBlur();
@@ -368,6 +372,8 @@ private:
 	int m_WindowH;
 	int m_ScreenX;								// X-postion on the virtual screen 
 	int m_ScreenY;								// Y-postion on the virtual screen
+	int m_SkinW;								// User defined width of skin
+	int m_SkinH;								// User defined height of skin
 	bool m_AnchorXFromRight;
 	bool m_AnchorYFromBottom;
 	bool m_AnchorXPercentage;
@@ -415,6 +421,8 @@ private:
 	bool m_Hidden;
 	RESIZEMODE m_ResizeWindow;
 
+	std::unordered_map<UINT_PTR, std::wstring> m_DelayedCommands;
+
 	std::vector<Measure*> m_Measures;
 	std::vector<Meter*> m_Meters;
 
@@ -427,6 +435,8 @@ private:
 	Gfx::FontCollection* m_FontCollection;
 
 	bool m_ToolTipHidden;
+
+	bool m_Favorite;
 
 	static int c_InstanceCount;
 

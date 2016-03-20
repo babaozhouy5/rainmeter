@@ -24,8 +24,8 @@
 #include <Wininet.h>
 #include <shlwapi.h>
 #include <process.h>
-#include "../../Library/pcre-8.10/config.h"
-#include "../../Library/pcre-8.10/pcre.h"
+#include "../../Library/pcre/config.h"
+#include "../../Library/pcre/pcre.h"
 #include "../../Common/StringUtil.h"
 #include "../API/RainmeterAPI.h"
 
@@ -203,6 +203,9 @@ struct MeasureData
 	std::wstring resultString;
 	std::wstring errorString;
 	std::wstring finishAction;
+	std::wstring onRegExpErrAction;
+	std::wstring onConnectErrAction;
+	std::wstring onDownloadErrAction;
 	std::wstring downloadFolder;
 	std::wstring downloadFile;
 	std::wstring downloadedFile;
@@ -243,7 +246,7 @@ struct MeasureData
 BYTE* DownloadUrl(HINTERNET handle, std::wstring& url, DWORD* dataSize, bool forceReload);
 unsigned __stdcall NetworkThreadProc(void* pParam);
 unsigned __stdcall NetworkDownloadThreadProc(void* pParam);
-void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize);
+void ParseData(MeasureData* measure, const BYTE* rawData, DWORD rawSize, bool utf16Data = false);
 
 CRITICAL_SECTION g_CriticalSection;
 ProxyCachePool* g_ProxyCachePool = nullptr;
@@ -255,21 +258,6 @@ static bool g_Debug = false;
 static std::unordered_map<std::wstring, WCHAR> g_CERs;
 
 #define OVECCOUNT 300    // should be a multiple of 3
-
-std::string ConvertAsciiToUTF8(LPCSTR str, int strLen, int codepage)
-{
-	std::string szUTF8;
-
-	if (str && *str)
-	{
-		std::wstring wide = StringUtil::Widen(str, strLen, codepage);
-		if (!wide.empty())
-		{
-			szUTF8.swap(StringUtil::NarrowUTF8(wide));
-		}
-	}
-	return szUTF8;
-}
 
 void DecodeReferences(std::wstring& str, int opt)
 {
@@ -737,6 +725,9 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 	measure->regExp = RmReadString(rm, L"RegExp", L"");
 	measure->finishAction = RmReadString(rm, L"FinishAction", L"", FALSE);
+	measure->onRegExpErrAction = RmReadString(rm, L"OnRegExpErrorAction", L"", FALSE);
+	measure->onConnectErrAction = RmReadString(rm, L"OnConnectErrorAction", L"", FALSE);
+	measure->onDownloadErrAction = RmReadString(rm, L"OnDownloadErrorAction", L"", FALSE);
 	measure->errorString = RmReadString(rm, L"ErrorString", L"");
 
 	int index = RmReadInt(rm, L"StringIndex", 0);
@@ -749,6 +740,10 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	measure->updateRate = RmReadInt(rm, L"UpdateRate", 600);
 	measure->forceReload = 0!=RmReadInt(rm, L"ForceReload", 0);
 	measure->codepage = RmReadInt(rm, L"CodePage", 0);
+	if (measure->codepage == 0)
+	{
+		measure->codepage = CP_UTF8;
+	}
 
 	measure->download = 0!=RmReadInt(rm, L"Download", 0);
 	if (measure->download)
@@ -852,6 +847,11 @@ unsigned __stdcall NetworkThreadProc(void* pParam)
 	if (!data)
 	{
 		ShowError(measure->rm, L"Fetch error");
+
+		if (!measure->onConnectErrAction.empty())
+		{
+			RmExecute(measure->skin, measure->onConnectErrAction.c_str());
+		}
 	}
 	else
 	{
@@ -871,7 +871,7 @@ unsigned __stdcall NetworkThreadProc(void* pParam)
 			}
 		}
 
-		ParseData(measure, (LPCSTR)data, dwSize);
+		ParseData(measure, data, dwSize);
 
 		free(data);
 	}
@@ -884,59 +884,37 @@ unsigned __stdcall NetworkThreadProc(void* pParam)
 	return 0;   // thread completed successfully
 }
 
-void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
+void ParseData(MeasureData* measure, const BYTE* rawData, DWORD rawSize, bool utf16Data)
 {
-	// Parse the value from the data
-	pcre* re;
+	const int UTF16_CODEPAGE = 1200;
+	if (measure->codepage == UTF16_CODEPAGE) {
+		utf16Data = true;
+	}
+
 	const char* error;
 	int erroffset;
 	int ovector[OVECCOUNT];
 	int rc;
-	int flags = PCRE_UTF8;
-
-	if (measure->codepage == 0)
-	{
-		flags = 0;
-	}
+	bool doErrorAction = false;
 
 	// Compile the regular expression in the first argument
-	re = pcre_compile(
-		StringUtil::NarrowUTF8(measure->regExp).c_str(),	// the pattern
-		flags,												// default options
-		&error,												// for error message
-		&erroffset,											// for error offset
-		nullptr);											// use default character tables
-
+	pcre16* re = pcre16_compile(
+		(PCRE_SPTR16)measure->regExp.c_str(),
+		PCRE_UTF16, &error, &erroffset, nullptr);
 	if (re != nullptr)
 	{
 		// Compilation succeeded: match the subject in the second argument
-		std::string utf8Data;
-
-		if (measure->codepage == 1200)		// 1200 = UTF-16LE
+		std::wstring buffer;
+		auto data = (const WCHAR*)rawData;
+		DWORD dataLength = rawSize / 2;
+		if (!utf16Data)
 		{
-			// Must convert the data to utf8
-			utf8Data = StringUtil::NarrowUTF8((LPCWSTR)parseData, dwSize / 2);
-			parseData = utf8Data.c_str();
-			dwSize = (DWORD)utf8Data.length();
-		}
-		else if (measure->codepage != CP_UTF8 && measure->codepage != 0)		// 0 = CP_ACP
-		{
-			// Must convert the data to utf8
-			utf8Data = ConvertAsciiToUTF8(parseData, dwSize, measure->codepage);
-			parseData = utf8Data.c_str();
-			dwSize = (DWORD)utf8Data.length();
+			buffer = StringUtil::Widen((LPCSTR)rawData, rawSize, measure->codepage);
+			data = buffer.c_str();
+			dataLength = (DWORD)buffer.length();
 		}
 
-		rc = pcre_exec(
-			re,						// the compiled pattern
-			nullptr,				// no extra data - we didn't study the pattern
-			parseData,				// the subject string
-			dwSize,					// the length of the subject
-			0,						// start at offset 0 in the subject
-			0,						// default options
-			ovector,				// output vector for substring information
-			OVECCOUNT);				// number of elements in the output vector
-
+		rc = pcre16_exec(re, nullptr, (PCRE_SPTR16)data, dataLength, 0, 0, ovector, OVECCOUNT);
 		if (rc >= 0)
 		{
 			if (rc == 0)
@@ -952,20 +930,16 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 					{
 						for (int i = 0; i < rc; ++i)
 						{
-							const char* substring_start = parseData + ovector[2 * i];
-							int substring_length = ovector[2 * i + 1] - ovector[2 * i];
-							substring_length = min(substring_length, 256);
-
-							const std::wstring value = StringUtil::WidenUTF8(substring_start, substring_length);
-							RmLogF(measure->rm, LOG_DEBUG, L"WebParser: Index %2d: %s", i, value.c_str());
+							const WCHAR* match = data + ovector[2 * i];
+							const int matchLen = min(ovector[2 * i + 1] - ovector[2 * i], 256);
+							RmLogF(measure->rm, LOG_DEBUG, L"WebParser: Index %2d: %.*s", i, matchLen, match);
 						}
 					}
 
-					const char* substring_start = parseData + ovector[2 * measure->stringIndex];
-					int substring_length = ovector[2 * measure->stringIndex + 1] - ovector[2 * measure->stringIndex];
-
+					const WCHAR* match = data + ovector[2 * measure->stringIndex];
+					int matchLen = ovector[2 * measure->stringIndex + 1] - ovector[2 * measure->stringIndex];
 					EnterCriticalSection(&g_CriticalSection);
-					measure->resultString = StringUtil::WidenUTF8(substring_start, substring_length);
+					measure->resultString.assign(match, matchLen);
 					DecodeReferences(measure->resultString, measure->decodeCharacterReference);
 					LeaveCriticalSection(&g_CriticalSection);
 				}
@@ -1003,15 +977,14 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 					{
 						if ((*i)->stringIndex < rc)
 						{
-							const char* substring_start = parseData + ovector[2 * (*i)->stringIndex];
-							int substring_length = ovector[2 * (*i)->stringIndex + 1] - ovector[2 * (*i)->stringIndex];
-
+							const WCHAR* match = data + ovector[2 * (*i)->stringIndex];
+							int matchLen = ovector[2 * (*i)->stringIndex + 1] - ovector[2 * (*i)->stringIndex];
 							if (!(*i)->regExp.empty())
 							{
 								// Change the index and parse the substring
 								int index = (*i)->stringIndex;
 								(*i)->stringIndex = (*i)->stringIndex2;
-								ParseData((*i), substring_start, substring_length);
+								ParseData((*i), (BYTE*)match, matchLen * 2, true);
 								(*i)->stringIndex = index;
 							}
 							else
@@ -1020,11 +993,10 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 								EnterCriticalSection(&g_CriticalSection);
 
 								// Substitude the [measure] with result
-								std::wstring result = StringUtil::WidenUTF8(substring_start, substring_length);
 								(*i)->resultString = (*i)->url;
 								(*i)->resultString.replace(
 									StringUtil::CaseInsensitiveFind((*i)->resultString, compareStr),
-									compareStr.size(), result);
+									compareStr.size(), match, matchLen);
 								DecodeReferences((*i)->resultString, (*i)->decodeCharacterReference);
 
 								// Start download threads for the references
@@ -1071,6 +1043,7 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 		{
 			// Matching failed: handle error cases
 			RmLogF(measure->rm, LOG_ERROR, L"WebParser: RegExp matching error (%d)", rc);
+			doErrorAction = true;
 
 			EnterCriticalSection(&g_CriticalSection);
 			measure->resultString = measure->errorString;
@@ -1092,12 +1065,13 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 		}
 
 		// Release memory used for the compiled pattern
-		pcre_free(re);
+		pcre16_free(re);
 	}
 	else
 	{
 		// Compilation failed.
 		RmLogF(measure->rm, LOG_ERROR, L"WebParser: RegExp error at offset %d: %S", erroffset, error);
+		doErrorAction = true;
 	}
 
 	if (measure->download)
@@ -1110,12 +1084,14 @@ void ParseData(MeasureData* measure, LPCSTR parseData, DWORD dwSize)
 			measure->dlThreadHandle = threadHandle;
 		}
 	}
-	else
+
+	if (doErrorAction && !measure->onRegExpErrAction.empty())
 	{
-		if (!measure->finishAction.empty())
-		{
-			RmExecute(measure->skin, measure->finishAction.c_str());
-		}
+		RmExecute(measure->skin, measure->onRegExpErrAction.c_str());
+	}
+	else if (!measure->download && !measure->finishAction.empty())
+	{
+		RmExecute(measure->skin, measure->finishAction.c_str());
 	}
 }
 
@@ -1403,6 +1379,11 @@ unsigned __stdcall NetworkDownloadThreadProc(void* pParam)
 					measure->rm, LOG_ERROR,
 					L"WebParser: Download failed (res=0x%08X, COM=0x%08X): %s",
 					result, resultCoInitialize, url.c_str());
+
+				if (!measure->onDownloadErrAction.empty())
+				{
+					RmExecute(measure->skin, measure->onDownloadErrAction.c_str());
+				}
 			}
 
 			if (SUCCEEDED(resultCoInitialize))
@@ -1413,6 +1394,11 @@ unsigned __stdcall NetworkDownloadThreadProc(void* pParam)
 		else
 		{
 			RmLogF(measure->rm, LOG_ERROR, L"WebParser: Download failed: %s", url.c_str());
+
+			if (!measure->onDownloadErrAction.empty())
+			{
+				RmExecute(measure->skin, measure->onDownloadErrAction.c_str());
+			}
 		}
 	}
 	else
@@ -1661,5 +1647,28 @@ PLUGIN_EXPORT void ExecuteBang(void* data, LPCWSTR args)
 		}
 
 		measure->updateCounter = 0;
+	}
+	else if (_wcsicmp(args, L"RESET") == 0)
+	{
+		measure->resultString.clear();
+		measure->downloadedFile.clear();
+
+		EnterCriticalSection(&g_CriticalSection);
+
+		// Update the references
+		std::vector<MeasureData*>::iterator i = g_Measures.begin();
+		std::wstring compareStr = L"[";
+		compareStr += RmGetMeasureName(measure->rm);
+		compareStr += L']';
+		for (; i != g_Measures.end(); ++i)
+		{
+			if ((StringUtil::CaseInsensitiveFind((*i)->url, compareStr) != std::wstring::npos) &&
+				(measure->skin == (*i)->skin))
+			{
+				(*i)->resultString.clear();
+				(*i)->downloadedFile.clear();
+			}
+		}
+		LeaveCriticalSection(&g_CriticalSection);
 	}
 }

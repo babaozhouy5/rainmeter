@@ -148,6 +148,10 @@ struct Measure
 	WAVEFORMATEX*			m_wfx;						// audio format info
 	IAudioClient*			m_clAudio;					// audio client instance
 	IAudioCaptureClient*	m_clCapture;				// capture client instance
+#if (WINDOWS_BUG_WORKAROUND)
+	IAudioClient*			m_clBugAudio;				// audio client for dummy silent channel
+	IAudioRenderClient*		m_clBugRender;				// render client for dummy silent channel
+#endif
 	WCHAR					m_reqID[64];				// requested device ID (parsed from options)
 	WCHAR					m_devName[64];				// device friendly name (detected in init)
 	float					m_kRMS[2];					// RMS attack/decay filter constants
@@ -192,6 +196,10 @@ struct Measure
 		m_wfx(NULL),
 		m_clAudio(NULL),
 		m_clCapture(NULL),
+#if (WINDOWS_BUG_WORKAROUND)
+		m_clBugAudio(NULL),
+		m_clBugRender(NULL),
+#endif
 		m_fftKWdw(NULL),
 		m_fftTmpIn(NULL),
 		m_fftTmpOut(NULL),
@@ -279,7 +287,7 @@ PLUGIN_EXPORT void Initialize (void** data, void* rm)
 			}
 		}
 
-		RmLogF(rm, LOG_ERROR, L"Couldn't find Parent measure '%s'.\n", parentName);
+		RmLogF(rm, LOG_ERROR, L"Couldn't find Parent measure '%s'.", parentName);
 	}
 
 	// this is a parent measure - add it to the global list
@@ -299,7 +307,7 @@ PLUGIN_EXPORT void Initialize (void** data, void* rm)
 		}
 		else
 		{
-			RmLogF(rm, LOG_ERROR, L"Invalid Port '%s', must be one of: Output or Input.\n", port);
+			RmLogF(rm, LOG_ERROR, L"Invalid Port '%s', must be one of: Output or Input.", port);
 		}
 	}
 
@@ -314,7 +322,7 @@ PLUGIN_EXPORT void Initialize (void** data, void* rm)
 	m->m_fftSize = RmReadInt(rm, L"FFTSize", m->m_fftSize);
 	if (m->m_fftSize < 0 || m->m_fftSize & 1)
 	{
-		RmLogF(rm, LOG_ERROR, L"Invalid FFTSize %ld: must be an even integer >= 0. (powers of 2 work best)\n", m->m_fftSize);
+		RmLogF(rm, LOG_ERROR, L"Invalid FFTSize %ld: must be an even integer >= 0. (powers of 2 work best)", m->m_fftSize);
 		m->m_fftSize = 0;
 	}
 
@@ -323,7 +331,7 @@ PLUGIN_EXPORT void Initialize (void** data, void* rm)
 		m->m_fftOverlap = RmReadInt(rm, L"FFTOverlap", m->m_fftOverlap);
 		if (m->m_fftOverlap < 0 || m->m_fftOverlap >= m->m_fftSize)
 		{
-			RmLogF(rm, LOG_ERROR, L"Invalid FFTOverlap %ld: must be an integer between 0 and FFTSize(%ld).\n", m->m_fftOverlap, m->m_fftSize);
+			RmLogF(rm, LOG_ERROR, L"Invalid FFTOverlap %ld: must be an integer between 0 and FFTSize(%ld).", m->m_fftOverlap, m->m_fftSize);
 			m->m_fftOverlap = 0;
 		}
 	}
@@ -332,7 +340,7 @@ PLUGIN_EXPORT void Initialize (void** data, void* rm)
 	m->m_nBands = RmReadInt(rm, L"Bands", m->m_nBands);
 	if (m->m_nBands < 0)
 	{
-		RmLogF(rm, LOG_ERROR, L"AudioLevel.dll: Invalid Bands %ld: must be an integer >= 0.\n", m->m_nBands);
+		RmLogF(rm, LOG_ERROR, L"AudioLevel.dll: Invalid Bands %ld: must be an integer >= 0.", m->m_nBands);
 		m->m_nBands = 0;
 	}
 
@@ -452,7 +460,7 @@ PLUGIN_EXPORT void Reload (void* data, void* rm, double* maxValue)
 					L"%s%s%s", i ? L", " : L" ", i == Measure::CHANNEL_SUM ? L"or " : L"", s_chanName[i][0]);
 			}
 
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".\n");
+			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
 			RmLogF(rm, LOG_ERROR, msg);
 		}
 	}
@@ -484,7 +492,7 @@ PLUGIN_EXPORT void Reload (void* data, void* rm, double* maxValue)
 					L"%s%s%s", i ? L", " : L" ", i == (Measure::NUM_TYPES - 1) ? L"or " : L"", s_typeName[i]);
 			}
 
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".\n");
+			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
 			RmLogF(rm, LOG_ERROR, msg);
 		}
 	}
@@ -1022,7 +1030,6 @@ PLUGIN_EXPORT LPCWSTR GetString (void* data)
 HRESULT	Measure::DeviceInit ()
 {
 	HRESULT hr;
-	IAudioRenderClient *clRender = NULL;
 
 	// get the device handle
 	assert(m_enum && !m_dev);
@@ -1034,7 +1041,7 @@ HRESULT	Measure::DeviceInit ()
 		if (hr != S_OK)
 		{
 			WCHAR msg[256];
-			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).\n",
+			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).",
 				m_port==PORT_OUTPUT ? L"output" : L"input", m_reqID, hr);
 
 			RmLog(LOG_WARNING, msg);
@@ -1064,11 +1071,20 @@ HRESULT	Measure::DeviceInit ()
 
 	SAFE_RELEASE(props);
 
-	// get the audio client
+#if (WINDOWS_BUG_WORKAROUND)
+	// get an extra audio client for the dummy silent channel
+	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clBugAudio);
+	if (hr != S_OK)
+	{
+		RmLog(LOG_WARNING, L"Failed to create audio client for Windows bug workaround.");
+	}
+#endif
+
+	// get the main audio client
 	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clAudio);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio client.\n");
+		RmLog(LOG_WARNING, L"Failed to create audio client.");
 	}
 
 	EXIT_ON_ERROR(hr);
@@ -1100,7 +1116,7 @@ HRESULT	Measure::DeviceInit ()
 
 	if(m_format == FMT_INVALID)
 	{
-		RmLog(LOG_WARNING, L"Invalid sample format.  Only PCM 16b integer or PCM 32b float are supported.\n");
+		RmLog(LOG_WARNING, L"Invalid sample format.  Only PCM 16b integer or PCM 32b float are supported.");
 	}
 
 	// setup FFT buffers
@@ -1151,36 +1167,29 @@ HRESULT	Measure::DeviceInit ()
 	// see: http://social.msdn.microsoft.com/Forums/windowsdesktop/en-US/c7ba0a04-46ce-43ff-ad15-ce8932c00171/loopback-recording-causes-digital-stuttering?forum=windowspro-audiodevelopment
 	if (m_port == PORT_OUTPUT)
 	{
-		hr = m_clAudio->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsRequestedDuration, 0, m_wfx, NULL);
+		hr = m_clBugAudio->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsRequestedDuration, 0, m_wfx, NULL);
 		EXIT_ON_ERROR(hr);
 
 		// get the frame count
 		UINT32 nFrames;
-		hr = m_clAudio->GetBufferSize(&nFrames);
+		hr = m_clBugAudio->GetBufferSize(&nFrames);
 		EXIT_ON_ERROR(hr);
 
 		// create a render client
-		hr = m_clAudio->GetService(IID_IAudioRenderClient, (void**)&clRender);
+		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)&m_clBugRender);
 		EXIT_ON_ERROR(hr);
 
 		// get the buffer
 		BYTE* buffer;
-		hr = clRender->GetBuffer(nFrames, &buffer);
+		hr = m_clBugRender->GetBuffer(nFrames, &buffer);
 		EXIT_ON_ERROR(hr);
 
 		// release it
-		hr = clRender->ReleaseBuffer(nFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+		hr = m_clBugRender->ReleaseBuffer(nFrames, AUDCLNT_BUFFERFLAGS_SILENT);
 		EXIT_ON_ERROR(hr);
 
-		// release the render client
-		clRender->Release();
-		clRender = NULL;
-
-		// release the audio client
-		m_clAudio->Release();
-
-		// create a new IAudioClient
-		hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clAudio);
+		// start the stream
+		hr = m_clBugAudio->Start();
 		EXIT_ON_ERROR(hr);
 	}
 	// ---------------------------------------------------------------------------------------
@@ -1191,7 +1200,7 @@ HRESULT	Measure::DeviceInit ()
 		hnsRequestedDuration, 0, m_wfx, NULL);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to initialize audio client.\n");
+		RmLog(LOG_WARNING, L"Failed to initialize audio client.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1199,7 +1208,7 @@ HRESULT	Measure::DeviceInit ()
 	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)&m_clCapture);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio capture client.\n");
+		RmLog(LOG_WARNING, L"Failed to create audio capture client.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1207,7 +1216,7 @@ HRESULT	Measure::DeviceInit ()
 	hr = m_clAudio->Start();
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to start the stream.\n");
+		RmLog(LOG_WARNING, L"Failed to start the stream.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1217,7 +1226,6 @@ HRESULT	Measure::DeviceInit ()
 	return S_OK;
 
 Exit:
-	SAFE_RELEASE(clRender);
 	DeviceRelease();
 	return hr;
 }
@@ -1228,7 +1236,17 @@ Exit:
  */
 void Measure::DeviceRelease ()
 {
-	RmLog(LOG_DEBUG, L"Releasing audio device.\n");
+#if (WINDOWS_BUG_WORKAROUND)
+	RmLog(LOG_DEBUG, L"Releasing dummy stream audio device.");
+	if (m_clBugAudio)
+	{
+		m_clBugAudio->Stop();
+	}
+	SAFE_RELEASE(m_clBugRender);
+	SAFE_RELEASE(m_clBugAudio);
+#endif
+
+	RmLog(LOG_DEBUG, L"Releasing audio device.");
 
 	if (m_clAudio)
 	{

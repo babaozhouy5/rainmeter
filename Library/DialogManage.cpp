@@ -469,19 +469,22 @@ void DialogManage::TabSkins::Create(HWND owner)
 			350, 166, 118, 14,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
 		CT_CHECKBOX(Id_DraggableCheckBox, ID_STR_DRAGGABLE,
-			350, 190, 118, 9,
+			350, 185, 118, 9,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
 		CT_CHECKBOX(Id_ClickThroughCheckBox, ID_STR_CLICKTHROUGH,
-			350, 203, 118, 9,
+			350, 198, 118, 9,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
 		CT_CHECKBOX(Id_KeepOnScreenCheckBox, ID_STR_KEEPONSCREEN,
-			350, 216, 118, 9,
+			350, 211, 118, 9,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
 		CT_CHECKBOX(Id_SavePositionCheckBox, ID_STR_SAVEPOSITION,
-			350, 229, 118, 9,
+			350, 224, 118, 9,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
 		CT_CHECKBOX(Id_SnapToEdgesCheckBox, ID_STR_SNAPTOEDGES,
-			350, 242, 118, 9,
+			350, 237, 118, 9,
+			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0),
+		CT_CHECKBOX(Id_FavoriteCheckBox, ID_STR_FAVORITE,
+			350, 250, 118, 9,
 			WS_VISIBLE | WS_TABSTOP | WS_DISABLED, 0)
 	};
 
@@ -531,6 +534,7 @@ void DialogManage::TabSkins::Initialize()
 	ComboBox_AddString(item, L"70%");
 	ComboBox_AddString(item, L"80%");
 	ComboBox_AddString(item, L"90%");
+	ComboBox_AddString(item, L"~100%");
 
 	item = GetControl(Id_ZPositionDropDownList);
 	ComboBox_AddString(item, GetString(ID_STR_ONDESKTOP));
@@ -659,12 +663,24 @@ void DialogManage::TabSkins::SetControls()
 		EnableWindow(item, TRUE);
 		Button_SetCheck(item, m_SkinWindow->GetSnapEdges());
 
+		item = GetControl(Id_FavoriteCheckBox);
+		EnableWindow(item, TRUE);
+		Button_SetCheck(item, m_SkinWindow->GetFavorite());
+
 		item = GetControl(Id_TransparencyDropDownList);
 		EnableWindow(item, TRUE);
-		int value = (int)(10 - m_SkinWindow->GetAlphaValue() / 25.5);
-		value = min(9, value);
-		value = max(0, value);
-		ComboBox_SetCurSel(item, value);
+		int alpha = m_SkinWindow->GetAlphaValue();
+		if (alpha <= 1)	// ~100%
+		{
+			ComboBox_SetCurSel(item, 10);
+		}
+		else
+		{
+			int value = (int)(10 - alpha / 25.5);
+			value = min(9, value);
+			value = max(0, value);
+			ComboBox_SetCurSel(item, value);
+		}
 
 		item = GetControl(Id_ZPositionDropDownList);
 		EnableWindow(item, TRUE);
@@ -755,6 +771,10 @@ void DialogManage::TabSkins::DisableControls(bool clear)
 	Button_SetCheck(item, BST_UNCHECKED);
 
 	item = GetControl(Id_SnapToEdgesCheckBox);
+	EnableWindow(item, FALSE);
+	Button_SetCheck(item, BST_UNCHECKED);
+
+	item = GetControl(Id_FavoriteCheckBox);
 	EnableWindow(item, FALSE);
 	Button_SetCheck(item, BST_UNCHECKED);
 
@@ -934,7 +954,7 @@ int DialogManage::TabSkins::PopulateTree(HWND tree, TVINSERTSTRUCT& tvi, int ind
 		tvi.item.iImage = tvi.item.iSelectedImage = 1;
 		for (int i = 0, isize = (int)skinFolder.files.size(); i < isize; ++i)
 		{
-			tvi.item.pszText = (WCHAR*)skinFolder.files[i].c_str();
+			tvi.item.pszText = (WCHAR*)skinFolder.files[i].filename.c_str();
 			TreeView_InsertItem(tree, &tvi);
 		}
 
@@ -1254,6 +1274,11 @@ INT_PTR DialogManage::TabSkins::OnCommand(WPARAM wParam, LPARAM lParam)
 	case Id_SnapToEdgesCheckBox:
 		m_IgnoreUpdate = true;
 		m_SkinWindow->SetSnapEdges(!m_SkinWindow->GetSnapEdges());
+		break;
+
+	case Id_FavoriteCheckBox:
+		m_IgnoreUpdate = true;
+		m_SkinWindow->SetFavorite(!m_SkinWindow->GetFavorite());
 		break;
 
 	case Id_ZPositionDropDownList:

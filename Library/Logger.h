@@ -23,9 +23,11 @@
 #include <cstdarg>
 #include <string>
 #include <list>
+#include <chrono>
 
 class Section;
 class Skin;
+class Measure;
 
 // Singleton class to handle and store log messages and control the log file.
 class Logger
@@ -63,13 +65,14 @@ public:
 	void LogSkinVF(Logger::Level level, Skin* skin, const WCHAR* format, va_list args);
 	void LogSection(Logger::Level level, Section* section, const WCHAR* message);
 	void LogSectionVF(Logger::Level level, Section* section, const WCHAR* format, va_list args);
+	void LogMeasureVF(Logger::Level level, Measure* section, const WCHAR* format, va_list args);
 
 	const std::wstring& GetLogFilePath() { return m_LogFilePath; }
 
 	const std::list<Entry>& GetEntries() { return m_Entries; }
 
 private:
-	void LogInternal(Level level, ULONGLONG timestamp, const WCHAR* source, const WCHAR* msg);
+	void LogInternal(Level level, std::chrono::system_clock::time_point timestamp, const WCHAR* source, const WCHAR* msg);
 
 	// Appends |entry| to the log file.
 	void WriteToLogFile(Entry& entry);
@@ -119,6 +122,14 @@ inline Logger& GetLogger() { return Logger::GetInstance(); }
 		va_list args; \
 		va_start(args, format); \
 		GetLogger().LogSkinVF(Logger::Level::name, skin, format, args); \
+		va_end(args); \
+	} \
+	\
+	inline void Log ## name ## F(Measure* measure, const WCHAR* format, ...)\
+	{ \
+		va_list args; \
+		va_start(args, format); \
+		GetLogger().LogMeasureVF(Logger::Level::name, measure, format, args); \
 		va_end(args); \
 	}
 

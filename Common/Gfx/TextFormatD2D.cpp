@@ -20,18 +20,58 @@
 #include "TextFormatD2D.h"
 #include "CanvasD2D.h"
 #include "Util/DWriteHelpers.h"
+#include "TextInlineFormat/TextInlineFormatCharacterSpacing.h"
+#include "TextInlineFormat/TextInlineFormatColor.h"
+#include "TextInlineFormat/TextInlineFormatFace.h"
+#include "TextInlineFormat/TextInlineFormatGradientColor.h"
+#include "TextInlineFormat/TextInlineFormatItalic.h"
+#include "TextInlineFormat/TextInlineFormatOblique.h"
+#include "TextInlineFormat/TextInlineFormatSize.h"
+#include "TextInlineFormat/TextInlineFormatStretch.h"
+#include "TextInlineFormat/TextInlineFormatStrikethrough.h"
+#include "TextInlineFormat/TextInlineFormatTypography.h"
+#include "TextInlineFormat/TextInlineFormatUnderline.h"
+#include "TextInlineFormat/TextInlineFormatWeight.h"
+#include "../StringUtil.h"
+#include "../../Library/ConfigParser.h"
+#include "../../Library/pcre/config.h"
+#include "../../Library/pcre/pcre.h"
+#include <ole2.h>  // For Gdiplus.h.
+#include <GdiPlus.h>
+
+namespace {
+
+D2D1_COLOR_F ToColorF(const Gdiplus::Color& color)
+{
+	return D2D1::ColorF(color.GetR() / 255.0f, color.GetG() / 255.0f, color.GetB() / 255.0f, color.GetA() / 255.0f);
+}
+
+int Clamp(int value, int _min, int _max)
+{
+	if (value < _min || value > _max)
+	{
+		value = max(_min, value);
+		value = min(value, _max);
+	}
+
+	return value;
+}
+
+}  // namespace
 
 namespace Gfx {
 
 TextFormatD2D::TextFormatD2D() :
 	m_ExtraHeight(),
 	m_LineGap(),
-	m_Trimming()
+	m_Trimming(),
+	m_HasInlineOptionsChanged(false)
 {
 }
 
 TextFormatD2D::~TextFormatD2D()
 {
+	m_TextInlineFormat.clear();
 }
 
 void TextFormatD2D::Dispose()
@@ -44,7 +84,7 @@ void TextFormatD2D::Dispose()
 	m_LineGap = 0.0f;
 }
 
-bool TextFormatD2D::CreateLayout(
+bool TextFormatD2D::CreateLayout(ID2D1RenderTarget* target,
 	const WCHAR* str, UINT strLen, float maxW, float maxH, bool gdiEmulation)
 {
 	bool strChanged = false;
@@ -69,7 +109,7 @@ bool TextFormatD2D::CreateLayout(
 		maxH += 2.0f;
 	}
 
-	if (m_TextLayout && !strChanged)
+	if (m_TextLayout && !strChanged && !m_HasInlineOptionsChanged)
 	{
 		if (maxW != m_TextLayout->GetMaxWidth())
 		{
@@ -98,6 +138,8 @@ bool TextFormatD2D::CreateLayout(
 			textLayout1->SetCharacterSpacing(emOffset, emOffset, 0.0f, range);
 		}
 
+		ApplyInlineFormatting(m_TextLayout.Get());
+
 		UINT32 lineCount = 0;
 		DWRITE_LINE_METRICS lineMetrics[2];
 		HRESULT hr = m_TextLayout->GetLineMetrics(lineMetrics, _countof(lineMetrics), &lineCount);
@@ -114,6 +156,21 @@ bool TextFormatD2D::CreateLayout(
 				m_TextLayout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 			}
 		}
+
+		// Build gradient brushes (if any)
+		for (const auto& fmt : m_TextInlineFormat)
+		{
+			if (fmt->GetType() == Gfx::InlineType::GradientColor)
+			{
+				auto option = dynamic_cast<TextInlineFormat_GradientColor*>(fmt.get());
+				option->BuildGradientBrushes(target, m_TextLayout.Get());
+			}
+		}
+
+		// Because the text layout can be created without any changes to any
+		// 'color' inline options, we need a way to update any color changes
+		// at drawing time. 
+		m_HasInlineOptionsChanged = true;
 	}
 
 	return true;
@@ -234,6 +291,16 @@ void TextFormatD2D::SetProperties(
 		m_ExtraHeight =
 			(((float)fmetrics.designUnitsPerEm / 8.0f) - fmetrics.lineGap) * pixelsPerDesignUnit;
 		m_LineGap = fmetrics.lineGap * pixelsPerDesignUnit;
+
+		// 'Face' inline objects need access to the font collection.
+		for (auto& fmt : m_TextInlineFormat)
+		{
+			if (fmt->GetType() == Gfx::InlineType::Face)
+			{
+				auto face = dynamic_cast<TextInlineFormat_Face*>(fmt.get());
+				face->SetFontCollection(fontCollectionD2D);
+			}
+		}
 	}
 	else
 	{
@@ -268,6 +335,8 @@ DWRITE_TEXT_METRICS TextFormatD2D::GetMetrics(
 		textLayout.GetAddressOf());
 	if (SUCCEEDED(hr))
 	{
+		ApplyInlineFormatting(textLayout.Get());
+
 		const float xOffset = m_TextFormat->GetFontSize() / 6.0f;
 		if (gdiEmulation)
 		{
@@ -362,6 +431,623 @@ void TextFormatD2D::SetVerticalAlignment(VerticalAlignment alignment)
 			(alignment == VerticalAlignment::Center) ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER :
 			DWRITE_PARAGRAPH_ALIGNMENT_FAR);
 	}
+}
+
+void TextFormatD2D::ReadInlineOptions(ConfigParser& parser, const WCHAR* section)
+{
+	const std::wstring delimiter(1, L'|');
+	std::wstring option = parser.ReadString(section, L"InlineSetting", L"");
+	std::wstring pattern = parser.ReadString(section, L"InlinePattern", L"");
+
+	size_t i = 1;
+	if (!option.empty() && !pattern.empty())
+	{
+		do
+		{
+			std::vector<std::wstring> args = ConfigParser::Tokenize(option, delimiter);
+			if (!CreateInlineOption(i - 1, pattern, args)) break;
+
+			// Check for InlineOption2/InlineValue2 ... etc.
+			const std::wstring num = std::to_wstring(++i);
+
+			std::wstring key = L"InlineSetting" + num;
+			option = parser.ReadString(section, key.c_str(), L"");
+			if (option.empty()) break;
+
+			key = L"InlinePattern" + num;
+			pattern = parser.ReadString(section, key.c_str(), L"");
+		} while (!pattern.empty());
+	}
+
+	// Remove any previous options that do not exist anymore
+	if (i <= m_TextInlineFormat.size())
+	{
+		m_HasInlineOptionsChanged = true;
+		m_TextInlineFormat.erase(m_TextInlineFormat.begin() + (i - 1), m_TextInlineFormat.end());
+	}
+}
+
+void TextFormatD2D::FindInlineRanges(const std::wstring& str)
+{
+	for (auto& fmt : m_TextInlineFormat)
+	{
+		std::vector<DWRITE_TEXT_RANGE> ranges;
+
+		int ovector[300];
+		const char* error;
+		int errorOffset = 0;
+		int offset = 0;
+		pcre16* re = pcre16_compile(
+			(PCRE_SPTR16)fmt->GetPattern().c_str(),
+			PCRE_UTF16,
+			&error,
+			&errorOffset,
+			nullptr);  // Use default character tables.
+		if (!re)
+		{
+			//LogNoticeF(this, L"InlinePattern%i error at offset %d: %S", errorOffset, error);
+		}
+		else
+		{
+			do
+			{
+				const int rc = pcre16_exec(
+					re,
+					nullptr,
+					(PCRE_SPTR16)str.c_str(),
+					(int)str.length(),
+					offset,
+					PCRE_NOTEMPTY,          // Empty string is not a valid match
+					ovector,
+					(int)_countof(ovector));
+				if (rc <= 0)
+				{
+					break;
+				}
+
+				const UINT32 start = ovector[0];
+				const UINT32 length = ovector[1] - ovector[0];
+
+				// No captures found, but the rest of the text is still 'found'.
+				if (rc == 1)
+				{
+					DWRITE_TEXT_RANGE range = { start, length };
+					ranges.push_back(range);
+				}
+				else if (rc > 1)	// Captures found.
+				{
+					for (int j = rc - 1; j > 0; --j)
+					{
+						const UINT32 newStart = ovector[2 * j];
+						const UINT32 inLength = ovector[2 * j + 1] - ovector[2 * j];
+
+						if (newStart < 0) break;	// Match was not found, so skip to the next item
+
+						DWRITE_TEXT_RANGE range = { newStart, inLength };
+						ranges.push_back(range);
+					}
+				}
+
+				offset = start + length;
+
+			} while (true);
+
+			pcre16_free(re);
+
+			// Gradients are set up differently then other options because they require 'inner ranges'
+			// when text is split between multiple lines - otherwise set the range.
+			if (fmt->GetType() == InlineType::GradientColor)
+			{
+				auto linearGradient = dynamic_cast<TextInlineFormat_GradientColor*>(fmt.get());
+				size_t index = 0;
+				for (const auto& range : ranges)
+				{
+					linearGradient->UpdateSubOptions(index, range);
+					++index;
+				}
+			}
+			else
+			{
+				fmt->SetRanges(ranges);
+			}
+		}
+	}
+}
+
+bool TextFormatD2D::CreateInlineOption(const size_t index, const std::wstring pattern, std::vector<std::wstring> options)
+{
+	if (options.empty()) return false;
+
+	const size_t optSize = options.size();
+	const WCHAR* option = options[0].c_str();
+	if (_wcsnicmp(option, L"NONE", 4) == 0)
+	{
+		if (index < m_TextInlineFormat.size())
+		{
+			// Special case to delete a specific index while keeping the rest of the options
+			m_TextInlineFormat.erase(m_TextInlineFormat.begin() + index);
+			m_HasInlineOptionsChanged = true;
+			return true;
+		}
+	}
+	else if (_wcsicmp(option, L"CHARACTERSPACING") == 0)
+	{
+		if (optSize > 1)
+		{
+			FLOAT leading = (FLOAT)ConfigParser::ParseDouble(options[1].c_str(), FLT_MAX);
+			FLOAT trailing = FLT_MAX;
+			FLOAT advanceWidth = -1.0f;
+
+			if (optSize > 2)
+			{
+				trailing = (FLOAT)ConfigParser::ParseDouble(options[2].c_str(), FLT_MAX);
+			}
+
+			if (optSize > 3)
+			{
+				advanceWidth = (FLOAT)ConfigParser::ParseDouble(options[3].c_str(), -1.0f);
+			}
+
+			UpdateInlineCharacterSpacing(index, pattern, leading, trailing, advanceWidth);
+			return true;
+		}
+	}
+	else if (_wcsicmp(option, L"COLOR") == 0)
+	{
+		if (optSize > 1)
+		{
+			Gdiplus::Color newColor = ConfigParser::ParseColor(options[1].c_str());
+			UpdateInlineColor(index, pattern, newColor);
+			return true;
+		}
+	}
+	else if (_wcsicmp(option, L"FACE") == 0)
+	{
+		if (optSize > 1)
+		{
+			UpdateInlineFace(index, pattern, options[1].c_str());
+			return true;
+		}
+	}
+	else if (_wcsnicmp(option, L"GRADIENTCOLOR", 13) == 0)
+	{
+		if (optSize >= 3)
+		{
+			bool altGamma = ConfigParser::ParseInt(option + 13, 0) != 0;
+			options.erase(options.begin());
+			UpdateInlineGradientColor(index, pattern, options, altGamma);
+			return true;
+		}
+	}
+	else if(_wcsicmp(option, L"ITALIC") == 0)
+	{
+		UpdateInlineItalic(index, pattern);
+		return true;
+	}
+	else if(_wcsicmp(option, L"OBLIQUE") == 0)
+	{
+		UpdateInlineOblique(index, pattern);
+		return true;
+	}
+	else if(_wcsicmp(option, L"SIZE") == 0)
+	{
+		if (optSize > 1)
+		{
+			FLOAT size = (FLOAT)ConfigParser::ParseInt(options[1].c_str(), 0);
+			UpdateInlineSize(index, pattern, size);
+			return true;
+		}
+	}
+	else if(_wcsicmp(option, L"STRETCH") == 0)
+	{
+		if (optSize > 1)
+		{
+			// DirectWrite supports 9 different stretch properties.
+			DWRITE_FONT_STRETCH stretch = (DWRITE_FONT_STRETCH)
+				Clamp(ConfigParser::ParseInt(options[1].c_str(), -1),
+				(int)DWRITE_FONT_STRETCH_ULTRA_CONDENSED,
+				(int)DWRITE_FONT_STRETCH_ULTRA_EXPANDED);
+			UpdateInlineStretch(index, pattern, stretch);
+			return true;
+		}
+	}
+	else if(_wcsicmp(option, L"STRIKETHROUGH") == 0)
+	{
+		UpdateInlineStrikethrough(index, pattern);
+		return true;
+	}
+	else if(_wcsicmp(option, L"TYPOGRAPHY") == 0)
+	{
+		// Typography 'tags' need to be extactly 4 characters.
+		if (optSize > 1 && options[1].size() == 4)
+		{
+			UINT32 parameter = 1;
+			DWRITE_FONT_FEATURE_TAG tag = (DWRITE_FONT_FEATURE_TAG)
+				DWRITE_MAKE_OPENTYPE_TAG(options[1][0], options[1][1], options[1][2], options[1][3]);
+
+			if (optSize > 2)
+			{
+				parameter = ConfigParser::ParseUInt(options[2].c_str(), 1u);
+			}
+
+			UpdateInlineTypography(index, pattern, tag, parameter);
+			return true;
+		}
+	}
+	else if(_wcsicmp(option, L"UNDERLINE") == 0)
+	{
+		UpdateInlineUnderline(index, pattern);
+		return true;
+	}
+	else if(_wcsicmp(option, L"WEIGHT") == 0)
+	{
+		if (optSize > 1)
+		{
+			// DirectWrite supports weight from 1 to 999.
+			DWRITE_FONT_WEIGHT weight = (DWRITE_FONT_WEIGHT)
+				Clamp(ConfigParser::ParseInt(options[1].c_str(), -1), 1, 999);
+			UpdateInlineWeight(index, pattern, weight);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void TextFormatD2D::UpdateInlineCharacterSpacing(const size_t& index, const std::wstring pattern,
+	const FLOAT leading, const FLOAT trailing, const FLOAT advanceWidth)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		// The |index| is larger than the number items in the array, so build a new
+		// 'CharacterSpacing' object (in place) at the end of the array.
+
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_CharacterSpacing(pattern, leading, trailing, advanceWidth));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::CharacterSpacing)
+	{
+		// |index| is within range, and the type of object is also a 'CharacterSpacing'
+		// object, so just update the object if needed.
+
+		auto option = dynamic_cast<TextInlineFormat_CharacterSpacing*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, leading, trailing, advanceWidth))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		// |index| is within range, but the types of objects do not match, thus destroy
+		// the previous object and replace it with a new 'CharacterSpacing' object.
+
+		m_TextInlineFormat[index].reset(new TextInlineFormat_CharacterSpacing(pattern, leading, trailing, advanceWidth));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineColor(const size_t& index, const std::wstring pattern, const Gdiplus::Color color)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Color(pattern, color));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Color)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Color*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, color))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Color(pattern, color));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineFace(const size_t& index, const std::wstring pattern, const WCHAR* face)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Face(pattern, face));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Face)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Face*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, face))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Face(pattern, face));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineGradientColor(const size_t& index, const std::wstring pattern,
+	const std::vector<std::wstring> args, const bool altGamma)
+{
+	const UINT32 angle = (360 + (ConfigParser::ParseInt(args[0].c_str(), 0) % 360)) % 360;
+
+	std::vector<std::wstring> tokens;
+	std::vector<D2D1_GRADIENT_STOP> stops(args.size() - 1);
+	for (size_t i = 1; i < args.size(); ++i)
+	{
+		tokens = ConfigParser::Tokenize(args[i], L";");
+		if (tokens.size() == 2)
+		{
+			stops[i - 1].color = ToColorF(ConfigParser::ParseColor(tokens[0].c_str()));
+			stops[i - 1].position = (float)ConfigParser::ParseDouble(tokens[1].c_str(), 0.0f);
+		}
+	}
+
+	// If gradient only has 1 stop, add a transparent stop at appropriate place
+	if (stops.size() == 1)
+	{
+		D2D1::ColorF color = { 0.0f, 0.0f, 0.0f, 0.0f };
+		D2D1_GRADIENT_STOP stop = { 0.0f, color };
+		if (stops[0].position < 0.5)
+		{
+			stop.position = 1.0f;
+		}
+
+		stops.push_back(stop);
+	}
+
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_GradientColor(pattern, angle, stops, altGamma));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::GradientColor)
+	{
+		auto option = dynamic_cast<TextInlineFormat_GradientColor*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, angle, stops, altGamma))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_GradientColor(pattern, angle, stops, altGamma));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineItalic(const size_t& index, const std::wstring pattern)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Italic(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Italic)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Italic*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Italic(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineOblique(const size_t& index, const std::wstring pattern)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Oblique(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Oblique)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Oblique*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Oblique(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineSize(const size_t& index, const std::wstring pattern, const FLOAT size)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Size(pattern, size));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Size)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Size*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, size))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Size(pattern, size));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineStretch(const size_t& index, const std::wstring pattern, const DWRITE_FONT_STRETCH stretch)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Stretch(pattern, stretch));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Stretch)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Stretch*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, stretch))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Stretch(pattern, stretch));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineStrikethrough(const size_t& index, const std::wstring pattern)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Strikethrough(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Strikethrough)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Strikethrough*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Strikethrough(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineTypography(const size_t& index, const std::wstring pattern,
+	const DWRITE_FONT_FEATURE_TAG tag, const UINT32 parameter)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Typography(pattern, tag, parameter));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Typography)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Typography*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, tag, parameter))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Typography(pattern, tag, parameter));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineUnderline(const size_t& index, const std::wstring pattern)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Underline(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Underline)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Underline*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Underline(pattern));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::UpdateInlineWeight(const size_t& index, const std::wstring pattern, const DWRITE_FONT_WEIGHT weight)
+{
+	if (index >= m_TextInlineFormat.size())
+	{
+		m_TextInlineFormat.emplace_back(new TextInlineFormat_Weight(pattern, weight));
+		m_HasInlineOptionsChanged = true;
+	}
+	else if (m_TextInlineFormat[index]->GetType() == Gfx::InlineType::Weight)
+	{
+		auto option = dynamic_cast<TextInlineFormat_Weight*>(m_TextInlineFormat[index].get());
+		if (option->CompareAndUpdateProperties(pattern, weight))
+		{
+			m_HasInlineOptionsChanged = true;
+		}
+	}
+	else
+	{
+		m_TextInlineFormat[index].reset(new TextInlineFormat_Weight(pattern, weight));
+		m_HasInlineOptionsChanged = true;
+	}
+}
+
+void TextFormatD2D::ApplyInlineFormatting(IDWriteTextLayout* layout)
+{
+	for (const auto& fmt : m_TextInlineFormat)
+	{
+		Gfx::InlineType type = fmt->GetType();
+		if (type != Gfx::InlineType::Color && type != Gfx::InlineType::GradientColor)
+		{
+			fmt->ApplyInlineFormat(layout);
+		}
+	}
+}
+
+void TextFormatD2D::ApplyInlineColoring(ID2D1RenderTarget* target, const D2D1_POINT_2F* point)
+{
+	// Color option
+	for (const auto& fmt : m_TextInlineFormat)
+	{
+		if (fmt->GetType() == Gfx::InlineType::Color)
+		{
+			auto option = dynamic_cast<TextInlineFormat_Color*>(fmt.get());
+			option->ApplyInlineFormat(target, m_TextLayout.Get());
+		}
+		else if (fmt->GetType() == Gfx::InlineType::GradientColor)
+		{
+			auto option = dynamic_cast<TextInlineFormat_GradientColor*>(fmt.get());
+			option->ApplyInlineFormat(m_TextLayout.Get(), point);
+		}
+	}
+
+	// Because it is expensive to recreate the text layout, we need some sort of way
+	// to tell the 'format' that the inline options have changed. Here, we reset that
+	// flag to false because the coloring of the text happen just before drawing.
+	m_HasInlineOptionsChanged = false;
+}
+
+void TextFormatD2D::ResetGradientPosition(const D2D1_POINT_2F* point)
+{
+	for (const auto& fmt : m_TextInlineFormat)
+	{
+		if (fmt->GetType() == Gfx::InlineType::GradientColor)
+		{
+			auto option = dynamic_cast<TextInlineFormat_GradientColor*>(fmt.get());
+			option->ApplyInlineFormat(nullptr, point, false);
+		}
+	}
+}
+
+void TextFormatD2D::ResetInlineColoring(ID2D1SolidColorBrush* solidColor, const UINT strLen)
+{
+	DWRITE_TEXT_RANGE range = { 0, strLen };
+	m_TextLayout->SetDrawingEffect(solidColor, range);
 }
 
 }  // namespace Gfx

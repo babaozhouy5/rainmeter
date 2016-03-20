@@ -21,8 +21,8 @@
 #include <string>
 #include <windows.h>
 #include "../../Common/RawString.h"
-#include "../../Library/pcre-8.10/config.h"
-#include "../../Library/pcre-8.10/pcre.h"
+#include "../../Library/pcre/config.h"
+#include "../../Library/pcre/pcre.h"
 
 class CFolderInfo
 {
@@ -63,6 +63,6 @@ private:
 	UINT64 m_Size;
 	UINT m_FileCount;
 	UINT m_FolderCount;
-	pcre* m_RegExpFilter;
+	pcre16* m_RegExpFilter;
 	DWORD m_LastUpdateTime;
 };

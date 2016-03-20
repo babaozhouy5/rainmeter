@@ -131,4 +131,12 @@ void TextFormatGDIP::SetVerticalAlignment(VerticalAlignment alignment)
 	m_StringFormat.SetLineAlignment((Gdiplus::StringAlignment)alignment);
 }
 
+void TextFormatGDIP::ReadInlineOptions(ConfigParser& parser, const WCHAR* section)
+{
+}
+
+void TextFormatGDIP::FindInlineRanges(const std::wstring& str)
+{
+}
+
 }  // namespace Gfx

@@ -117,96 +117,72 @@ void MeasureNet::UpdateIFTable()
 	}
 	else
 	{
-		if (c_Table == nullptr)
-		{
-			// Gotta reserve few bytes for the tables
-			DWORD value = 0;
-			if (GetNumberOfInterfaces(&value) == NO_ERROR)
-			{
-				if (c_NumOfTables != value)
-				{
-					c_NumOfTables = value;
-					logging = true;
-				}
+		DWORD ret, size = 0;
+		MIB_IFTABLE* ifTable = (MIB_IFTABLE*)c_Table;
 
-				if (c_NumOfTables > 0)
-				{
-					DWORD size = sizeof(MIB_IFTABLE) + sizeof(MIB_IFROW) * c_NumOfTables;
-					c_Table = new BYTE[size];
-				}
-			}
+		if ((ret = GetIfTable(ifTable, &size, FALSE)) == ERROR_INSUFFICIENT_BUFFER)
+		{
+			delete [] c_Table;
+			c_Table = new BYTE[size];
+
+			ifTable = (MIB_IFTABLE*)c_Table;
+
+			ret = GetIfTable(ifTable, &size, FALSE);
 		}
 
-		if (c_Table)
+		if (ret == NO_ERROR)
 		{
-			DWORD ret, size = 0;
-
-			MIB_IFTABLE* ifTable = (MIB_IFTABLE*)c_Table;
-
-			if ((ret = GetIfTable(ifTable, &size, FALSE)) == ERROR_INSUFFICIENT_BUFFER)
+			if (c_NumOfTables != ifTable->dwNumEntries)
 			{
-				delete [] c_Table;
-				c_Table = new BYTE[size];
-
-				ifTable = (MIB_IFTABLE*)c_Table;
-
-				ret = GetIfTable(ifTable, &size, FALSE);
+				c_NumOfTables = ifTable->dwNumEntries;
+				logging = true;
 			}
 
-			if (ret == NO_ERROR)
+			if (GetRainmeter().GetDebug() && logging)
 			{
-				if (c_NumOfTables != ifTable->dwNumEntries)
-				{
-					c_NumOfTables = ifTable->dwNumEntries;
-					logging = true;
-				}
+				LogDebug(L"------------------------------");
+				LogDebugF(L"* NETWORK-INTERFACE: Count=%i", c_NumOfTables);
 
-				if (GetRainmeter().GetDebug() && logging)
+				for (size_t i = 0; i < c_NumOfTables; ++i)
 				{
-					LogDebug(L"------------------------------");
-					LogDebugF(L"* NETWORK-INTERFACE: Count=%i", c_NumOfTables);
-
-					for (size_t i = 0; i < c_NumOfTables; ++i)
+					const WCHAR* type = L"";
+					switch (ifTable->table[i].dwType)
 					{
-						const WCHAR* type = L"";
-						switch (ifTable->table[i].dwType)
-						{
-						case IF_TYPE_ETHERNET_CSMACD:
-							type = L"Ethernet";
-							break;
-						case IF_TYPE_PPP:
-							type = L"PPP";
-							break;
-						case IF_TYPE_SOFTWARE_LOOPBACK:
-							type = L"Loopback";
-							break;
-						case IF_TYPE_IEEE80211:
-							type = L"IEEE802.11";
-							break;
-						case IF_TYPE_TUNNEL:
-							type = L"Tunnel";
-							break;
-						case IF_TYPE_IEEE1394:
-							type = L"IEEE1394";
-							break;
-						default:
-							type = L"Other";
-							break;
-						}
-
-						LogDebugF(L"%i: %.*S", (int)i + 1, ifTable->table[i].dwDescrLen, (char*)ifTable->table[i].bDescr);
-						LogDebugF(L"  Type=%s(%i)", type, ifTable->table[i].dwType);
+					case IF_TYPE_ETHERNET_CSMACD:
+						type = L"Ethernet";
+						break;
+					case IF_TYPE_PPP:
+						type = L"PPP";
+						break;
+					case IF_TYPE_SOFTWARE_LOOPBACK:
+						type = L"Loopback";
+						break;
+					case IF_TYPE_IEEE80211:
+						type = L"IEEE802.11";
+						break;
+					case IF_TYPE_TUNNEL:
+						type = L"Tunnel";
+						break;
+					case IF_TYPE_IEEE1394:
+						type = L"IEEE1394";
+						break;
+					default:
+						type = L"Other";
+						break;
 					}
-					LogDebug(L"------------------------------");
+
+					LogDebugF(L"%i: %.*S", (int)i + 1, ifTable->table[i].dwDescrLen, (char*)ifTable->table[i].bDescr);
+					LogDebugF(L"  Type=%s(%i)", type, ifTable->table[i].dwType);
 				}
+				LogDebug(L"------------------------------");
 			}
-			else
-			{
-				// Something's wrong. Unable to get the table.
-				delete [] c_Table;
-				c_Table = nullptr;
-				c_NumOfTables = 0;
-			}
+		}
+		else
+		{
+			// Something's wrong. Unable to get the table.
+			delete [] c_Table;
+			c_Table = nullptr;
+			c_NumOfTables = 0;
 		}
 	}
 }
@@ -400,10 +376,6 @@ ULONG64 MeasureNet::GetNetStatsValue(NET net)
 	return value;
 }
 
-/*
-** Updates the current value.
-**
-*/
 void MeasureNet::UpdateValue()
 {
 	if (c_Table == nullptr) return;
@@ -441,10 +413,6 @@ void MeasureNet::UpdateValue()
 	}
 }
 
-/*
-** Read the options specified in the ini file.
-**
-*/
 void MeasureNet::ReadOptions(ConfigParser& parser, const WCHAR* section)
 {
 	Measure::ReadOptions(parser, section);
@@ -478,7 +446,18 @@ void MeasureNet::ReadOptions(ConfigParser& parser, const WCHAR* section)
 		}
 	}
 
-	m_Interface = parser.ReadInt(section, L"Interface", 0);
+	// Option 'Interface' represents either the number of the interface in the 'iftable',
+	// or the name of the interface (ie. its Description). Optionally, if 'Interface=Best',
+	// there will be an attempt to find the best interface.
+	std::wstring iface = parser.ReadString(section, L"Interface", L"");
+	if (!iface.empty() && !std::all_of(iface.begin(), iface.end(), iswdigit))
+	{
+		m_Interface = GetBestInterfaceOrByName(iface.c_str());
+	}
+	else
+	{
+		m_Interface = parser.ReadInt(section, L"Interface", 0);
+	}
 
 	m_Cumulative = parser.ReadBool(section, L"Cumulative", false);
 	if (m_Cumulative)
@@ -502,10 +481,79 @@ void MeasureNet::ReadOptions(ConfigParser& parser, const WCHAR* section)
 	}
 }
 
-/*
-** Updates the statistics.
-**
-*/
+UINT MeasureNet::GetBestInterfaceOrByName(const WCHAR* iface)
+{
+	if (c_Table == nullptr) return 0;
+
+	if (_wcsicmp(iface, L"BEST") == 0)
+	{
+		DWORD dwBestIndex;
+		if (NO_ERROR == GetBestInterface(INADDR_ANY, &dwBestIndex))
+		{
+			if (c_GetIfTable2)
+			{
+				MIB_IF_ROW2* table = (MIB_IF_ROW2*)((MIB_IF_TABLE2*)c_Table)->Table;
+				for (size_t i = 0; i < c_NumOfTables; ++i)
+				{
+					if (table[i].InterfaceIndex == (NET_IFINDEX)dwBestIndex)
+					{
+						if (GetRainmeter().GetDebug())
+						{
+							LogDebugF(this, L"Using network interface: Number=(%i), Name=\"%s\"", i + 1, table[i].Description);
+						}
+
+						return (i + 1);
+					}
+				}
+			}
+			else
+			{
+				MIB_IFROW* table = (MIB_IFROW*)((MIB_IFTABLE*)c_Table)->table;
+				for (size_t i = 0; i < c_NumOfTables; ++i)
+				{
+					if (table[i].dwIndex == (NET_IFINDEX)dwBestIndex)
+					{
+						if (GetRainmeter().GetDebug())
+						{
+							LogDebugF(this, L"Using network interface: Number=(%i), Name=\"%.*S\"", (int)i + 1, table[i].dwDescrLen, (char*)table[i].bDescr);
+						}
+
+						return (i + 1);
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		if (c_GetIfTable2)
+		{
+			MIB_IF_ROW2* table = (MIB_IF_ROW2*)((MIB_IF_TABLE2*)c_Table)->Table;
+			for (size_t i = 0; i < c_NumOfTables; ++i)
+			{
+				if (_wcsicmp(iface, table[i].Description) == 0)
+				{
+					return (i + 1);
+				}
+			}
+		}
+		else
+		{
+			MIB_IFROW* table = (MIB_IFROW*)((MIB_IFTABLE*)c_Table)->table;
+			for (size_t i = 0; i < c_NumOfTables; ++i)
+			{
+				if (_wcsicmp(iface, StringUtil::Widen((char*)table[i].bDescr).c_str()) == 0)
+				{
+					return (i + 1);
+				}
+			}
+		}
+	}
+
+	LogErrorF(this, L"Cannot find interface: \"%s\"", iface);
+	return 0;
+}
+
 void MeasureNet::UpdateStats()
 {
 	if (c_Table)
@@ -560,19 +608,11 @@ void MeasureNet::UpdateStats()
 	}
 }
 
-/*
-** Resets the statistics.
-**
-*/
 void MeasureNet::ResetStats()
 {
 	c_StatValues.clear();
 }
 
-/*
-** Reads statistics.
-**
-*/
 void MeasureNet::ReadStats(const std::wstring& iniFile, std::wstring& statsDate)
 {
 	WCHAR buffer[48];
@@ -625,10 +665,6 @@ void MeasureNet::ReadStats(const std::wstring& iniFile, std::wstring& statsDate)
 	}
 }
 
-/*
-** Writes statistics.
-**
-*/
 void MeasureNet::WriteStats(const WCHAR* iniFile, const std::wstring& statsDate)
 {
 	WCHAR buffer[48];
@@ -675,10 +711,6 @@ void MeasureNet::WriteStats(const WCHAR* iniFile, const std::wstring& statsDate)
 	WritePrivateProfileSection(L"Statistics", data.c_str(), iniFile);
 }
 
-/*
-** Prepares in order to use the new APIs which are available on Vista or newer.
-**
-*/
 void MeasureNet::InitializeStatic()
 {
 	if (IsWindowsVistaOrGreater())
@@ -703,10 +735,6 @@ void MeasureNet::InitializeStatic()
 	}
 }
 
-/*
-** Frees the resources.
-**
-*/
 void MeasureNet::FinalizeStatic()
 {
 	if (c_GetIfTable2)
